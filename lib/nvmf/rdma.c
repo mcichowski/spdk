@@ -697,12 +697,17 @@ nvmf_rdma_resources_create(struct spdk_nvmf_rdma_resource_opts *opts)
 					       SPDK_MALLOC_DMA);
 	}
 
-	SPDK_DEBUGLOG(rdma, "Command Array: %p Length: %lx\n",
+	SPDK_ERRLOG( "Command Array: %p Length: %lx\n",
 		      resources->cmds, opts->max_queue_depth * sizeof(*resources->cmds));
-	SPDK_DEBUGLOG(rdma, "Completion Array: %p Length: %lx\n",
+	SPDK_ERRLOG( "Completion Array: %p Length: %lx\n",
 		      resources->cpls, opts->max_queue_depth * sizeof(*resources->cpls));
+	SPDK_ERRLOG( "In Capsule Data Array: %p Length: %x\n",
+			      resources->bufs, opts->max_queue_depth *
+			      opts->in_capsule_data_size);
+
+	
 	if (resources->bufs) {
-		SPDK_DEBUGLOG(rdma, "In Capsule Data Array: %p Length: %x\n",
+		SPDK_ERRLOG( "In Capsule Data Array: %p Length: %x\n",
 			      resources->bufs, opts->max_queue_depth *
 			      opts->in_capsule_data_size);
 	}
