@@ -697,12 +697,6 @@ nvmf_rdma_resources_create(struct spdk_nvmf_rdma_resource_opts *opts)
 					       SPDK_MALLOC_DMA);
 	}
 
-	if (!resources->reqs || !resources->recvs || !resources->cmds ||
-	    !resources->cpls || (opts->in_capsule_data_size && !resources->bufs)) {
-		SPDK_ERRLOG("Unable to allocate sufficient memory for RDMA queue.\n");
-		goto cleanup;
-	}
-
 	SPDK_DEBUGLOG(rdma, "Command Array: %p Length: %lx\n",
 		      resources->cmds, opts->max_queue_depth * sizeof(*resources->cmds));
 	SPDK_DEBUGLOG(rdma, "Completion Array: %p Length: %lx\n",
@@ -712,6 +706,14 @@ nvmf_rdma_resources_create(struct spdk_nvmf_rdma_resource_opts *opts)
 			      resources->bufs, opts->max_queue_depth *
 			      opts->in_capsule_data_size);
 	}
+
+	if (!resources->reqs || !resources->recvs || !resources->cmds ||
+	    !resources->cpls || (opts->in_capsule_data_size && !resources->bufs)) {
+		SPDK_ERRLOG("Unable to allocate sufficient memory for demo queue.\n");
+		goto cleanup;
+	}
+
+	
 
 	/* Initialize queues */
 	STAILQ_INIT(&resources->incoming_queue);
