@@ -190,6 +190,27 @@ enum spdk_nvmf_rdma_wr_type {
 	RDMA_WR_TYPE_DATA,
 };
 
+struct spdk_rdma_device_filter {
+	char **device_names;    /* Array of device names to filter */
+	char **device_guids;    /* Array of device GUIDs to filter */
+	size_t name_count;      /* Number of names in device_names */
+	size_t guid_count;      /* Number of GUIDs in device_guids */
+	pthread_mutex_t mutex;  /* For thread-safe access */
+	bool initialized;       /* True if the filter has been initialized */
+	size_t filtered_count;  /* Statistics: number of devices filtered out */
+};
+
+static struct spdk_rdma_device_filter g_rdma_device_filter = {
+	.device_names = NULL,
+	.device_guids = NULL,
+	.name_count = 0,
+	.guid_count = 0,
+	/* Mutex will be initialized in spdk_rdma_device_filter_init */
+	.initialized = false,
+	.filtered_count = 0
+};
+
+
 struct spdk_nvmf_rdma_wr {
 	/* Uses enum spdk_nvmf_rdma_wr_type */
 	uint8_t type;
@@ -833,6 +854,259 @@ cleanup:
 	nvmf_rdma_resources_destroy(resources);
 	return NULL;
 }
+
+/* Helper function to trim whitespace from a string (modifies the string) */
+static char *
+spdk_rdma_trim_whitespace(char *str)
+{
+	char *end;
+
+	/* Trim leading space */
+	while (isspace((unsigned char)*str)) {
+		str++;
+	}
+
+	if (*str == 0) { /* All spaces? */
+		return str;
+	}
+
+	/* Trim trailing space */
+	end = str + strlen(str) - 1;
+	while (end > str && isspace((unsigned char)*end)) {
+		end--;
+	}
+
+	/* Write new null terminator character */
+	end[1] = '\0';
+
+	return str;
+}
+
+/* Parses a comma-separated string from an environment variable into an array of strings. */
+static int
+spdk_rdma_parse_filter_env(const char *env_var_name, char ***entries, size_t *count)
+{
+	const char *env_value;
+	char *env_copy = NULL, *token, *saveptr;
+	char **temp_entries = NULL;
+	size_t temp_count = 0;
+	size_t capacity = 8; /* Initial allocation capacity */
+
+	assert(entries != NULL);
+	assert(count != NULL);
+
+	*entries = NULL;
+	*count = 0;
+
+	env_value = getenv(env_var_name);
+	if (!env_value || strlen(env_value) == 0) {
+		return 0; /* No variable set or empty, not an error */
+	}
+
+	env_copy = strdup(env_value);
+	if (!env_copy) {
+		SPDK_ERRLOG("Failed to allocate memory for environment variable '%s' content.\n", env_var_name);
+		return -ENOMEM;
+	}
+
+	temp_entries = calloc(capacity, sizeof(char *));
+	if (!temp_entries) {
+		SPDK_ERRLOG("Failed to allocate memory for filter entries.\n");
+		free(env_copy);
+		return -ENOMEM;
+	}
+
+	token = strtok_r(env_copy, ",", &saveptr);
+	while (token != NULL) {
+		char *trimmed_token = spdk_rdma_trim_whitespace(token);
+
+		if (strlen(trimmed_token) > 0) {
+			if (temp_count >= capacity) {
+				capacity *= 2;
+				char **resized_entries = realloc(temp_entries, capacity * sizeof(char *));
+				if (!resized_entries) {
+					SPDK_ERRLOG("Failed to reallocate memory for filter entries.\n");
+					for (size_t i = 0; i < temp_count; i++) {
+						free(temp_entries[i]);
+					}
+					free(temp_entries);
+					free(env_copy);
+					return -ENOMEM;
+				}
+				temp_entries = resized_entries;
+			}
+
+			temp_entries[temp_count] = strdup(trimmed_token);
+			if (!temp_entries[temp_count]) {
+				SPDK_ERRLOG("Failed to duplicate token string.\n");
+				for (size_t i = 0; i < temp_count; i++) {
+					free(temp_entries[i]);
+				}
+				free(temp_entries);
+				free(env_copy);
+				return -ENOMEM;
+			}
+			temp_count++;
+		}
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+
+	free(env_copy);
+	*entries = temp_entries;
+	*count = temp_count;
+	return 0;
+}
+
+/* Initializes the RDMA device filter by reading environment variables. */
+static int
+spdk_rdma_device_filter_init(void)
+{
+	int rc;
+
+	if (g_rdma_device_filter.initialized) {
+		return 0;
+	}
+
+	rc = pthread_mutex_init(&g_rdma_device_filter.mutex, NULL);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to initialize device filter mutex: %s.\n", strerror(rc));
+		return -rc; /* Return negative errno */
+	}
+
+	/* Parse device name filter */
+	rc = spdk_rdma_parse_filter_env("SPDK_RDMA_DEVICE_NAME_FILTER",
+					&g_rdma_device_filter.device_names,
+					&g_rdma_device_filter.name_count);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to parse SPDK_RDMA_DEVICE_NAME_FILTER.\n");
+		pthread_mutex_destroy(&g_rdma_device_filter.mutex);
+		return rc;
+	}
+
+	/* Parse device GUID filter */
+	rc = spdk_rdma_parse_filter_env("SPDK_RDMA_DEVICE_GUID_FILTER",
+					&g_rdma_device_filter.device_guids,
+					&g_rdma_device_filter.guid_count);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to parse SPDK_RDMA_DEVICE_GUID_FILTER.\n");
+		for (size_t i = 0; i < g_rdma_device_filter.name_count; i++) {
+			free(g_rdma_device_filter.device_names[i]);
+		}
+		free(g_rdma_device_filter.device_names);
+		g_rdma_device_filter.device_names = NULL;
+		g_rdma_device_filter.name_count = 0;
+		pthread_mutex_destroy(&g_rdma_device_filter.mutex);
+		return rc;
+	}
+
+	g_rdma_device_filter.initialized = true;
+	g_rdma_device_filter.filtered_count = 0;
+
+	if (g_rdma_device_filter.name_count > 0 || g_rdma_device_filter.guid_count > 0) {
+		SPDK_NOTICELOG("RDMA device filter initialized: %zu name filter(s), %zu GUID filter(s).\n",
+			       g_rdma_device_filter.name_count,
+			       g_rdma_device_filter.guid_count);
+	} else {
+		SPDK_DEBUGLOG(rdma, "RDMA device filter initialized (no filters defined, permissive mode).\n");
+	}
+
+	return 0;
+}
+
+/* Cleans up resources used by the RDMA device filter. */
+static void
+spdk_rdma_device_filter_cleanup(void)
+{
+	if (!g_rdma_device_filter.initialized) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_rdma_device_filter.mutex);
+
+	if (g_rdma_device_filter.filtered_count > 0) {
+		SPDK_NOTICELOG("RDMA device filter statistics: %zu device(s) were filtered out.\n",
+			       g_rdma_device_filter.filtered_count);
+	}
+
+	for (size_t i = 0; i < g_rdma_device_filter.name_count; i++) {
+		free(g_rdma_device_filter.device_names[i]);
+	}
+	free(g_rdma_device_filter.device_names);
+	g_rdma_device_filter.device_names = NULL;
+	g_rdma_device_filter.name_count = 0;
+
+	for (size_t i = 0; i < g_rdma_device_filter.guid_count; i++) {
+		free(g_rdma_device_filter.device_guids[i]);
+	}
+	free(g_rdma_device_filter.device_guids);
+	g_rdma_device_filter.device_guids = NULL;
+	g_rdma_device_filter.guid_count = 0;
+
+	g_rdma_device_filter.initialized = false;
+	/* filtered_count is reset on next init */
+
+	pthread_mutex_unlock(&g_rdma_device_filter.mutex);
+	pthread_mutex_destroy(&g_rdma_device_filter.mutex);
+
+	SPDK_DEBUGLOG(rdma, "RDMA device filter cleaned up.\n");
+}
+
+/* Checks if a given RDMA device should be filtered out based on its name or GUID. */
+static bool
+spdk_rdma_device_is_filtered(const char *device_name, uint64_t raw_guid)
+{
+	int rc;
+	char guid_str[33]; /* GUID string: 16 hex bytes * 2 chars/byte + null */
+
+	if (!g_rdma_device_filter.initialized) {
+		rc = spdk_rdma_device_filter_init();
+		if (rc != 0) {
+			SPDK_WARNLOG("RDMA device filter initialization failed (%d); all devices will be allowed.\n", rc);
+			return false; /* Fail open: if filter init fails, don't filter anything */
+		}
+	}
+
+	/* If no filters are configured, the device is not filtered (permissive). */
+	if (g_rdma_device_filter.name_count == 0 && g_rdma_device_filter.guid_count == 0) {
+		return false;
+	}
+
+	/* Convert raw GUID to string for comparison */
+	snprintf(guid_str, sizeof(guid_str), "%016"PRIx64, be64toh(raw_guid));
+
+	bool matched = false;
+	pthread_mutex_lock(&g_rdma_device_filter.mutex);
+
+	/* Check against device name filters */
+	if (device_name) {
+		for (size_t i = 0; i < g_rdma_device_filter.name_count; i++) {
+			if (strcmp(device_name, g_rdma_device_filter.device_names[i]) == 0) {
+				matched = true;
+				break;
+			}
+		}
+	}
+
+	/* Check against device GUID filters if not already matched by name */
+	if (!matched) {
+		for (size_t i = 0; i < g_rdma_device_filter.guid_count; i++) {
+			if (strcmp(guid_str, g_rdma_device_filter.device_guids[i]) == 0) {
+				matched = true;
+				break;
+			}
+		}
+	}
+
+	if (matched) {
+		g_rdma_device_filter.filtered_count++;
+		SPDK_DEBUGLOG(rdma, "Device '%s' (GUID: %s) matches filter criteria and will be skipped.\n",
+			      device_name ? device_name : "N/A", guid_str);
+	}
+
+	pthread_mutex_unlock(&g_rdma_device_filter.mutex);
+	return matched; /* True if device matches a filter and should be skipped */
+}
+
 
 static void
 nvmf_rdma_qpair_clean_ibv_events(struct spdk_nvmf_rdma_qpair *rqpair)
@@ -2505,6 +2779,8 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 		 struct spdk_nvmf_rdma_device **new_device)
 {
 	struct spdk_nvmf_rdma_device	*device;
+	const char *dev_name;
+	uint64_t dev_guid_be;
 	int				flag = 0;
 	int				rc = 0;
 
@@ -2515,11 +2791,24 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 	}
 	device->context = context;
 	rc = ibv_query_device(device->context, &device->attr);
+	dev_name = ibv_get_device_name(context->device);
+	dev_guid_be = ibv_get_device_guid(context->device);
+
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to query RDMA device attributes.\n");
 		free(device);
 		return rc;
 	}
+	if (spdk_rdma_device_is_filtered(dev_name, dev_guid_be)) {
+		SPDK_INFOLOG(rdma, "RDMA device '%s' (GUID: %016" PRIx64 ") is filtered out. "
+						   "Not creating SPDK device representation.\n",
+					 dev_name ? dev_name : "N/A", be64toh(dev_guid_be));
+		free(device);
+		// The spdk_rdma_device_is_filtered function itself also logs when a device is filtered.
+		// You can choose to keep this log or rely on the one inside the filter function.
+		return 0; // Indicate that the device should not be used/created
+	}
+
 
 #ifdef SPDK_CONFIG_RDMA_SEND_WITH_INVAL
 	if ((device->attr.device_cap_flags & IBV_DEVICE_MEM_MGT_EXTENSIONS) == 0) {
@@ -2648,6 +2937,14 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 	if (!rtransport) {
 		return NULL;
 	}
+
+	rc = spdk_rdma_device_filter_init();
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to initialize RDMA device filter: %s\n", strerror(-rc));
+		// Depending on policy, you might return NULL or handle the error
+		// For permissive filtering, you might just log and continue
+	}
+
 
 	TAILQ_INIT(&rtransport->devices);
 	TAILQ_INIT(&rtransport->ports);
@@ -2781,11 +3078,16 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 	i = 0;
 	rc = 0;
 	while (contexts[i] != NULL) {
+
 		rc = create_ib_device(rtransport, contexts[i], &device);
 		if (rc < 0) {
 			break;
 		}
 		i++;
+		if (rc == 0) {
+			//skip filtered devices
+			continue;
+		}
 		max_device_sge = spdk_min(max_device_sge, device->attr.max_sge);
 		device->is_ready = true;
 	}
@@ -2897,6 +3199,9 @@ nvmf_rdma_destroy(struct spdk_nvmf_transport *transport,
 	spdk_mempool_free(rtransport->data_wr_pool);
 
 	spdk_poller_unregister(&rtransport->accept_poller);
+
+	spdk_rdma_device_filter_cleanup();
+
 	free(rtransport);
 
 	if (cb_fn) {
@@ -3223,6 +3528,12 @@ nvmf_rdma_check_devices_context(struct spdk_nvmf_rdma_transport *rtransport,
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to create ib device for context: %s(%p)\n",
 			    ibv_get_device_name(context->device), context);
+		return false;
+	}
+
+	if (rc  == 0) {
+		SPDK_ERRLOG("Failed to create ib device for context due to filter criteria: %s(%p)\n",
+				ibv_get_device_name(context->device), context);
 		return false;
 	}
 
