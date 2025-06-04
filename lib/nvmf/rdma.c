@@ -2806,7 +2806,7 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 		free(device);
 		// The spdk_rdma_device_is_filtered function itself also logs when a device is filtered.
 		// You can choose to keep this log or rely on the one inside the filter function.
-		return 0; // Indicate that the device should not be used/created
+		return 2; // Indicate that the device should not be used/created
 	}
 
 
@@ -3084,7 +3084,7 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 			break;
 		}
 		i++;
-		if (rc == 0) {
+		if (rc == 2) {
 			//skip filtered devices
 			continue;
 		}
@@ -3531,7 +3531,7 @@ nvmf_rdma_check_devices_context(struct spdk_nvmf_rdma_transport *rtransport,
 		return false;
 	}
 
-	if (rc  == 0) {
+	if (rc  == 2) {
 		SPDK_ERRLOG("Failed to create ib device for context due to filter criteria: %s(%p)\n",
 				ibv_get_device_name(context->device), context);
 		return false;
