@@ -1097,14 +1097,14 @@ spdk_rdma_device_is_filtered(const char *device_name, uint64_t raw_guid)
 		}
 	}
 
-	if (matched) {
+	if (!matched) {
 		g_rdma_device_filter.filtered_count++;
 		SPDK_DEBUGLOG(rdma, "Device '%s' (GUID: %s) matches filter criteria and will be skipped.\n",
 			      device_name ? device_name : "N/A", guid_str);
 	}
 
 	pthread_mutex_unlock(&g_rdma_device_filter.mutex);
-	return matched; /* True if device matches a filter and should be skipped */
+	return !matched; /* True if device matches should be filtered out */
 }
 
 
